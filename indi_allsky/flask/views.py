@@ -7,6 +7,7 @@ import time
 import math
 import base64
 from pathlib import Path
+import inotify.adapters
 import socket
 import ipaddress
 import re
@@ -490,17 +491,35 @@ class LatestImageMjpegView(BaseView):
         image_path = image_dir.joinpath(image_name)
 
         def generate():
-            last_mtime = 0
-            while True:
-                if image_path.exists():
-                    mtime = image_path.stat().st_mtime
-                    if mtime != last_mtime:
-                        last_mtime = mtime
+            """Stream the latest image using an inotify-based watcher."""
+
+            if image_path.exists():
+                with io.open(str(image_path), 'rb') as img:
+                    frame = img.read()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
+            notifier = inotify.adapters.Inotify()
+            notifier.add_watch(str(image_dir))
+
+            try:
+                for event in notifier.event_gen(timeout_s=1, yield_nones=True):
+                    if event is None:
+                        continue
+
+                    (_, type_names, path, filename) = event
+
+                    if filename != image_name:
+                        continue
+
+                    if {'IN_CLOSE_WRITE', 'IN_MODIFY', 'IN_MOVED_TO'}.intersection(type_names):
                         with io.open(str(image_path), 'rb') as img:
                             frame = img.read()
                         yield (b'--frame\r\n'
                                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                time.sleep(1)
+            finally:
+                notifier.remove_watch(str(image_dir))
+                notifier.close()
 
         return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
